@@ -1,0 +1,8 @@
+{
+  "name": "Remix Photobooth Frame Puncher",
+  "description": "Công cụ chuyên nghiệp đục lỗ trống trong suốt cho frame photobooth và xuất file PDF chuẩn kèm PNG overlay cho phần mềm photobooth.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
