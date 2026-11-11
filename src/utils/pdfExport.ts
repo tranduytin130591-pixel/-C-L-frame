@@ -212,8 +212,9 @@ export function triggerFileDownload(data: Uint8Array | Blob, filename: string, m
   a.download = filename;
   document.body.appendChild(a);
   a.click();
-  setTimeout(() => {
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, 100);
+  document.body.removeChild(a);
+  // Keep the blob URL alive long enough for the download to be read. In the desktop
+  // (Electron) build the file is only read after the user confirms the Save dialog,
+  // so revoking it quickly cancels the download.
+  setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
 }

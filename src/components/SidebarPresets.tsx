@@ -18,6 +18,7 @@ import {
 import { HoleItem, LayoutPreset, FrameDimensions, OverlayItem } from '../types';
 import { STANDARD_PRESETS, generateSampleFrameCanvas, getPresetWithDpi } from '../data/sampleFrames';
 import { STICKER_COLLECTION } from '../data/stickers';
+import { getOrCreateCachedImage } from '../utils/canvasPuncher';
 
 interface SidebarPresetsProps {
   currentPresetId: string;
@@ -118,21 +119,43 @@ export const SidebarPresets: React.FC<SidebarPresetsProps> = ({
     reader.onload = (event) => {
       const src = event.target?.result as string;
       if (!src) return;
-      const logoWidth = Math.round(dimensions.widthPx * 0.35);
-      const logoHeight = Math.round(logoWidth * 0.5);
-      const newItem: OverlayItem = {
-        id: 'logo_' + Date.now(),
-        type: 'logo',
-        imageSrc: src,
-        width: logoWidth,
-        height: logoHeight,
-        opacity: 1,
-        rotation: 0,
-        x: Math.round(dimensions.widthPx / 2 - logoWidth / 2),
-        y: Math.round(dimensions.heightPx - logoHeight - 40),
+      // Load the image first so the logo keeps its real aspect ratio and is ready to draw
+      const img = getOrCreateCachedImage(src);
+      const place = () => {
+        const natW = img.naturalWidth || 2;
+        const natH = img.naturalHeight || 1;
+        const aspect = natW / natH;
+        // Fit inside 35% of the frame width and 15% of its height
+        const maxW = dimensions.widthPx * 0.35;
+        const maxH = dimensions.heightPx * 0.15;
+        let logoWidth = maxW;
+        let logoHeight = logoWidth / aspect;
+        if (logoHeight > maxH) {
+          logoHeight = maxH;
+          logoWidth = logoHeight * aspect;
+        }
+        logoWidth = Math.max(1, Math.round(logoWidth));
+        logoHeight = Math.max(1, Math.round(logoHeight));
+        const newItem: OverlayItem = {
+          id: 'logo_' + Date.now(),
+          type: 'logo',
+          imageSrc: src,
+          width: logoWidth,
+          height: logoHeight,
+          opacity: 1,
+          rotation: 0,
+          x: Math.round(dimensions.widthPx / 2 - logoWidth / 2),
+          y: Math.max(0, Math.round(dimensions.heightPx - logoHeight - 40)),
+        };
+        onAddOverlay(newItem);
+        onSelectOverlay?.(newItem.id);
       };
-      onAddOverlay(newItem);
-      onSelectOverlay?.(newItem.id);
+      if (img.complete && img.naturalWidth > 0) {
+        place();
+      } else {
+        img.addEventListener('load', place, { once: true });
+        img.addEventListener('error', () => alert('Không đọc được file logo.'), { once: true });
+      }
     };
     reader.readAsDataURL(file);
     e.target.value = '';

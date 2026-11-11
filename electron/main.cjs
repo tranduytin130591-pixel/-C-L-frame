@@ -1,6 +1,41 @@
 // Electron entry point: wraps the Vite-built web app (dist/) in a desktop window.
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell, dialog } = require('electron');
 const path = require('path');
+
+/**
+ * Exported PDF/PNG files arrive as browser downloads. Ask where to save them with a
+ * native Save dialog (remembering the last folder). PFP_DOWNLOAD_DIR saves straight into
+ * a folder without a dialog (used for automated testing).
+ */
+function setupDownloads(win) {
+  let lastDir = app.getPath('documents');
+  win.webContents.session.on('will-download', (_event, item) => {
+    const filename = item.getFilename();
+    const autoDir = process.env.PFP_DOWNLOAD_DIR;
+    if (autoDir) {
+      item.setSavePath(path.join(autoDir, filename));
+      return;
+    }
+    const ext = path.extname(filename).toLowerCase();
+    const filters =
+      ext === '.pdf'
+        ? [{ name: 'PDF', extensions: ['pdf'] }]
+        : ext === '.png'
+        ? [{ name: 'PNG', extensions: ['png'] }]
+        : [];
+    const savePath = dialog.showSaveDialogSync(win, {
+      title: 'Lưu file',
+      defaultPath: path.join(lastDir, filename),
+      filters: [...filters, { name: 'Tất cả', extensions: ['*'] }],
+    });
+    if (!savePath) {
+      item.cancel();
+      return;
+    }
+    lastDir = path.dirname(savePath);
+    item.setSavePath(savePath);
+  });
+}
 
 const isDev = !app.isPackaged && process.env.ELECTRON_DEV_URL;
 
@@ -19,6 +54,8 @@ function createWindow() {
       sandbox: true,
     },
   });
+
+  setupDownloads(win);
 
   // Open external links (e.g. https://...) in the user's browser, not inside the app
   win.webContents.setWindowOpenHandler(({ url }) => {

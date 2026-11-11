@@ -257,19 +257,24 @@ export function calculateSmartHoles(
     let bottomSlotW = (contentW - gap) / 2;
 
     if (config.aspectRatio !== 'fit') {
+      // Every slot keeps the chosen aspect ratio. The big photo spans the same width as
+      // the two small ones plus the gap; shrink everything if it doesn't fit vertically.
       const ar = config.aspectRatio;
-      const testTopH = topW / ar;
-      if (testTopH < totalH * 0.65) {
-        topH = testTopH;
-        bottomH = totalH - topH;
+      topH = topW / ar;
+      bottomH = bottomSlotW / ar;
+      if (topH + gap + bottomH > contentH) {
+        // Solve for width W (top width): W/ar + gap + (W - gap)/(2*ar) = contentH
+        const w = (2 * ar * (contentH - gap) + gap) / 3;
+        topW = Math.max(1, w);
+        bottomSlotW = Math.max(1, (topW - gap) / 2);
+        topH = topW / ar;
+        bottomH = bottomSlotW / ar;
       }
-      const testBottomH = bottomSlotW / ar;
-      bottomH = Math.min(bottomH, testBottomH);
     }
 
     const totalUsedH = topH + gap + bottomH;
     const startY = marginTop + (contentH - totalUsedH) / 2;
-    const startX = marginLeft;
+    const startX = marginLeft + (contentW - topW) / 2;
 
     // Slot 1 (Large top)
     holes.push(createHole(1, startX, startY, topW, topH));

@@ -415,11 +415,13 @@ export function detectHoleAtPoint(
   const targetB = data[startIdx + 2];
   const targetA = data[startIdx + 3];
 
-  // If clicking transparent pixel, cannot detect
-  if (targetA < 10) return null;
+  // Clicking a transparent pixel: the frame already has a see-through window here
+  // (common for designer-exported PNGs). Detect that transparent region as the slot.
+  const transparentMode = targetA < 10;
 
   const maxDistSq = (tolerance * 1.5) * (tolerance * 1.5);
   function colorMatch(idx: number): boolean {
+    if (transparentMode) return data[idx + 3] < 128;
     if (data[idx + 3] < 10) return false;
     // Euclidean color distance in RGB
     const dr = data[idx] - targetR;
@@ -484,24 +486,24 @@ export function detectHoleAtPoint(
     return result;
   };
 
-  // A region spanning (almost) the whole frame is the frame background/border, not a photo slot
-  if (boxW >= w * 0.97 && boxH >= h * 0.97) {
+  // A region spanning (almost) the whole frame, or covering most of its area, is the
+  // frame background/border, not a photo slot
+  if ((boxW >= w * 0.97 && boxH >= h * 0.97) || count >= total * 0.6) {
     return remember(null);
   }
 
   // Must be a reasonable size for a photo hole (e.g. > 35px width and height)
   if (boxW >= 35 && boxH >= 35 && count > 1000) {
     const boxArea = boxW * boxH;
-    const fillRatio = count / boxArea;
 
-    // Only a (practically) full bounding box is a plain rectangle. Anything else — a
-    // sticker biting into a corner, rounded/circular slots, odd shapes — gets the traced
-    // contour so the cut hugs the region and never chops decorations off. Even a small
-    // corner sticker covers only a few % of the box, so the threshold must be strict.
+    // Only a completely filled bounding box is a plain rectangle. Anything else — a
+    // sticker biting into an edge (even by a few pixels), rounded/circular slots, odd
+    // shapes — gets the traced contour so the cut hugs the region and never chops
+    // decorations off. A clean rectangle still simplifies to 4 points.
     let points: { x: number; y: number }[] | undefined;
     let type: 'rect' | 'rounded' | 'circle' | 'polygon' = 'rect';
 
-    if (fillRatio < 0.995) {
+    if (count < boxArea) {
       const contour = traceContourPoints(mask, w, h, minX, minY, maxX, maxY);
       if (contour.length > 5) {
         points = contour;
