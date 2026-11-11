@@ -12,19 +12,61 @@ import { CanvasArea } from './components/CanvasArea';
 import { PropertiesPanel } from './components/PropertiesPanel';
 import { ExportModal } from './components/ExportModal';
 import { AutoArrangeModal } from './components/AutoArrangeModal';
+import { DetectedHoleResult } from './utils/canvasPuncher';
+
+interface HistorySnapshot {
+  holes: HoleItem[];
+  overlays: OverlayItem[];
+}
+
+const MAX_HISTORY = 100;
+const HISTORY_DEBOUNCE_MS = 350;
+
+/**
+ * Polygon holes store absolute contour points. When the hole's bounding box is moved
+ * or resized, map the points from the old box into the new one so the cut follows.
+ */
+function syncPolygonPoints(prev: HoleItem, next: HoleItem): HoleItem {
+  if (next.type !== 'polygon' || !prev.points || prev.points.length === 0) return next;
+  if (
+    prev.x === next.x &&
+    prev.y === next.y &&
+    prev.width === next.width &&
+    prev.height === next.height
+  ) {
+    return { ...next, points: prev.points };
+  }
+  const sx = next.width / (prev.width || 1);
+  const sy = next.height / (prev.height || 1);
+  return {
+    ...next,
+    points: prev.points.map((p) => ({
+      x: next.x + (p.x - prev.x) * sx,
+      y: next.y + (p.y - prev.y) * sy,
+    })),
+  };
+}
+
+/** Apply a geometry patch to a hole, keeping polygon points in sync */
+function patchHole(hole: HoleItem, patch: Partial<HoleItem>): HoleItem {
+  return syncPolygonPoints(hole, { ...hole, ...patch });
+}
+
+function holesFromPreset(preset: LayoutPreset): HoleItem[] {
+  const stamp = Date.now();
+  return preset.holes.map((h, i) => ({
+    ...h,
+    id: `hole-${stamp}-${i}`,
+    order: h.order || i + 1,
+  }));
+}
 
 export default function App() {
   const initialPreset = STANDARD_PRESETS[0];
 
   const [currentPresetId, setCurrentPresetId] = useState<string>(initialPreset.id);
   const [dimensions, setDimensions] = useState<FrameDimensions>(initialPreset.frameDimensions);
-  const [holes, setHoles] = useState<HoleItem[]>(() =>
-    initialPreset.holes.map((h, i) => ({
-      ...h,
-      id: `hole-${Date.now()}-${i}`,
-      order: h.order || i + 1,
-    }))
-  );
+  const [holes, setHoles] = useState<HoleItem[]>(() => holesFromPreset(initialPreset));
   const [selectedHoleId, setSelectedHoleId] = useState<string | null>(null);
   const [overlays, setOverlays] = useState<OverlayItem[]>([]);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
@@ -35,23 +77,103 @@ export default function App() {
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
   const [isAutoArrangeModalOpen, setIsAutoArrangeModalOpen] = useState<boolean>(false);
 
+  // ---------------------------------------------------------------------------
   // Undo / Redo history
-  const [history, setHistory] = useState<HoleItem[][]>([]);
-  const [historyIdx, setHistoryIdx] = useState<number>(-1);
+  // Every change to holes or overlays is snapshotted automatically (debounced so a
+  // slider drag becomes one step). Changes during a canvas drag are committed once
+  // when the drag ends.
+  // ---------------------------------------------------------------------------
+  const holesRef = useRef(holes);
+  const overlaysRef = useRef(overlays);
+  holesRef.current = holes;
+  overlaysRef.current = overlays;
 
-  // Record history
-  const recordHistory = useCallback(
-    (newHoles: HoleItem[]) => {
-      setHistory((prev) => {
-        const next = prev.slice(0, historyIdx + 1);
-        return [...next, newHoles];
-      });
-      setHistoryIdx((prev) => prev + 1);
+  const historyRef = useRef<HistorySnapshot[]>([{ holes, overlays }]);
+  const historyIdxRef = useRef(0);
+  const [historyState, setHistoryState] = useState({ idx: 0, length: 1 });
+  const interactingRef = useRef(false);
+  const commitTimerRef = useRef<number | null>(null);
+
+  const syncHistoryState = () =>
+    setHistoryState({ idx: historyIdxRef.current, length: historyRef.current.length });
+
+  const commitHistory = useCallback(() => {
+    if (commitTimerRef.current !== null) {
+      clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
+    const current = historyRef.current[historyIdxRef.current];
+    const snap = { holes: holesRef.current, overlays: overlaysRef.current };
+    if (current && current.holes === snap.holes && current.overlays === snap.overlays) return;
+
+    const next = historyRef.current.slice(0, historyIdxRef.current + 1);
+    next.push(snap);
+    while (next.length > MAX_HISTORY) next.shift();
+    historyRef.current = next;
+    historyIdxRef.current = next.length - 1;
+    syncHistoryState();
+  }, []);
+
+  const scheduleCommit = useCallback(
+    (delay: number) => {
+      if (commitTimerRef.current !== null) clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = window.setTimeout(commitHistory, delay);
     },
-    [historyIdx]
+    [commitHistory]
   );
 
-  // Initialize frame canvas on mount or preset switch
+  /** Start a fresh history (used when the frame itself changes) */
+  const resetHistory = (newHoles: HoleItem[], newOverlays: OverlayItem[]) => {
+    if (commitTimerRef.current !== null) {
+      clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
+    historyRef.current = [{ holes: newHoles, overlays: newOverlays }];
+    historyIdxRef.current = 0;
+    syncHistoryState();
+  };
+
+  useEffect(() => {
+    if (interactingRef.current) return;
+    scheduleCommit(HISTORY_DEBOUNCE_MS);
+  }, [holes, overlays, scheduleCommit]);
+
+  const handleInteractionChange = useCallback(
+    (active: boolean) => {
+      interactingRef.current = active;
+      if (!active) scheduleCommit(0);
+    },
+    [scheduleCommit]
+  );
+
+  const restoreSnapshot = (snap: HistorySnapshot) => {
+    setHoles(snap.holes);
+    setOverlays(snap.overlays);
+    if (selectedHoleId && !snap.holes.some((h) => h.id === selectedHoleId)) {
+      setSelectedHoleId(null);
+    }
+    if (selectedOverlayId && !snap.overlays.some((o) => o.id === selectedOverlayId)) {
+      setSelectedOverlayId(null);
+    }
+  };
+
+  const handleUndo = () => {
+    commitHistory(); // flush a pending edit so it can be undone too
+    if (historyIdxRef.current <= 0) return;
+    historyIdxRef.current -= 1;
+    restoreSnapshot(historyRef.current[historyIdxRef.current]);
+    syncHistoryState();
+  };
+
+  const handleRedo = () => {
+    commitHistory();
+    if (historyIdxRef.current >= historyRef.current.length - 1) return;
+    historyIdxRef.current += 1;
+    restoreSnapshot(historyRef.current[historyIdxRef.current]);
+    syncHistoryState();
+  };
+
+  // Initialize frame canvas on mount
   useEffect(() => {
     const canvas = generateSampleFrameCanvas(
       initialPreset.defaultFrameStyle || 'retro',
@@ -65,11 +187,7 @@ export default function App() {
   const handleSelectPreset = (preset: LayoutPreset) => {
     setCurrentPresetId(preset.id);
     setDimensions(preset.frameDimensions);
-    const newHoles: HoleItem[] = preset.holes.map((h, i) => ({
-      ...h,
-      id: `hole-${Date.now()}-${i}`,
-      order: h.order || i + 1,
-    }));
+    const newHoles = holesFromPreset(preset);
     setHoles(newHoles);
     setSelectedHoleId(newHoles[0]?.id || null);
 
@@ -80,7 +198,7 @@ export default function App() {
       preset.frameDimensions.heightPx
     );
     setFrameCanvas(canvas);
-    recordHistory(newHoles);
+    resetHistory(newHoles, overlays);
   };
 
   // Handle uploaded image
@@ -95,15 +213,71 @@ export default function App() {
         const ctx = canvas.getContext('2d')!;
         ctx.drawImage(img, 0, 0);
 
-        // Determine physical dimensions at 300 DPI
-        const dpi = 300;
-        const wInch = Number((img.width / dpi).toFixed(1));
-        const hInch = Number((img.height / dpi).toFixed(1));
+        const prevDims = dimensions;
+        const sx = img.width / prevDims.widthPx;
+        const sy = img.height / prevDims.heightPx;
+        // Same shape as the current layout (e.g. a 2x6 design exported at 300 or 600 DPI)
+        const sameAspect = Math.abs(sx / sy - 1) < 0.01;
+
+        let dpi: number;
+        let wInch: number;
+        let hInch: number;
+        if (sameAspect && prevDims.physicalWidthInch > 0) {
+          // Keep the print size of the current layout and infer the file's real DPI
+          wInch = prevDims.physicalWidthInch;
+          hInch = prevDims.physicalHeightInch;
+          dpi = Math.round(img.width / wInch);
+        } else {
+          // Unknown print size: assume 300 DPI
+          dpi = 300;
+          wInch = Number((img.width / dpi).toFixed(1));
+          hInch = Number((img.height / dpi).toFixed(1));
+        }
+
+        // Holes: scale them onto the new frame when the shape matches; otherwise the old
+        // positions are meaningless (and may lie outside the frame), so start empty.
+        const nextHoles: HoleItem[] = sameAspect
+          ? holesRef.current.map((h) => ({
+              ...h,
+              x: Math.round(h.x * sx),
+              y: Math.round(h.y * sy),
+              width: Math.round(h.width * sx),
+              height: Math.round(h.height * sy),
+              borderRadius: h.borderRadius ? Math.round(h.borderRadius * sx) : 0,
+              points: h.points?.map((p) => ({ x: p.x * sx, y: p.y * sy })),
+            }))
+          : [];
+
+        // Overlays keep their relative position; size scales uniformly so they don't distort
+        const s = Math.min(sx, sy);
+        const nextOverlays: OverlayItem[] = overlaysRef.current.map((o) => {
+          const width = Math.round(o.width * s);
+          const height = Math.round(o.height * s);
+          if (o.type === 'text') {
+            // Text x/y is the anchor (center), not the top-left corner
+            return {
+              ...o,
+              x: Math.round(o.x * sx),
+              y: Math.round(o.y * sy),
+              width,
+              height,
+              fontSize: o.fontSize ? Math.round(o.fontSize * s) : undefined,
+            };
+          }
+          return {
+            ...o,
+            x: Math.round(Math.min(Math.max(0, o.x * sx), Math.max(0, img.width - width))),
+            y: Math.round(Math.min(Math.max(0, o.y * sy), Math.max(0, img.height - height))),
+            width,
+            height,
+            fontSize: o.fontSize ? Math.round(o.fontSize * s) : undefined,
+          };
+        });
 
         setDimensions({
           widthPx: img.width,
           heightPx: img.height,
-          dpi: 300,
+          dpi,
           name: `Ảnh tải lên (${wInch}" × ${hInch}")`,
           aspectRatio: `${img.width}:${img.height}`,
           physicalWidthInch: wInch,
@@ -112,6 +286,11 @@ export default function App() {
 
         setFrameCanvas(canvas);
         setCurrentPresetId('custom-upload');
+        setHoles(nextHoles);
+        setOverlays(nextOverlays);
+        setSelectedHoleId(null);
+        setSelectedOverlayId(null);
+        resetHistory(nextHoles, nextOverlays);
       };
       img.src = e.target?.result as string;
     };
@@ -138,38 +317,38 @@ export default function App() {
       borderRadius: type === 'rounded' ? 20 : type === 'circle' ? Math.round(w / 2) : 0,
     };
 
-    const nextHoles = [...holes, newHole];
-    setHoles(nextHoles);
+    setHoles([...holes, newHole]);
     setSelectedHoleId(newHole.id);
-    recordHistory(nextHoles);
   };
 
-  // Auto-detected hole from magic wand
-  const handleAddDetectedHole = (box: { x: number; y: number; width: number; height: number }) => {
+  // Auto-detected hole from magic wand (keeps the traced contour when it avoids stickers)
+  const handleAddDetectedHole = (box: DetectedHoleResult) => {
+    const isPolygon = box.type === 'polygon' && !!box.points && box.points.length > 2;
+    const type: HoleType = isPolygon ? 'polygon' : box.type === 'rounded' ? 'rounded' : 'rect';
     const newHole: HoleItem = {
       id: `hole-${Date.now()}`,
       order: holes.length + 1,
-      type: 'rect',
+      type,
       x: box.x,
       y: box.y,
       width: box.width,
       height: box.height,
       rotation: 0,
-      borderRadius: 0,
+      borderRadius: type === 'rounded' ? box.borderRadius ?? 8 : 0,
+      points: isPolygon ? box.points : undefined,
+      smartBoundaryDetect: isPolygon || undefined,
     };
 
-    const nextHoles = [...holes, newHole];
-    setHoles(nextHoles);
+    setHoles([...holes, newHole]);
     setSelectedHoleId(newHole.id);
-    recordHistory(nextHoles);
+    setSelectedOverlayId(null);
     setMagicWandActive(false); // Turn off after detecting
   };
 
-  // Update hole properties
-  const handleUpdateHole = (updated: HoleItem) => {
-    const nextHoles = holes.map((h) => (h.id === updated.id ? updated : h));
-    setHoles(nextHoles);
-  };
+  // Update hole properties (functional update so rapid drag events never use stale state)
+  const handleUpdateHole = useCallback((updated: HoleItem) => {
+    setHoles((prev) => prev.map((h) => (h.id === updated.id ? syncPolygonPoints(h, updated) : h)));
+  }, []);
 
   // Convert workspace resolution to target DPI (e.g. 300, 450, 600 DPI)
   const handleConvertDpi = (newDpi: number) => {
@@ -185,7 +364,7 @@ export default function App() {
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(frameCanvas, 0, 0, newCanvas.width, newCanvas.height);
 
-    // Scale holes
+    // Scale holes (including polygon contour points)
     const scaledHoles: HoleItem[] = holes.map((h) => ({
       ...h,
       x: Math.round(h.x * scale),
@@ -193,6 +372,7 @@ export default function App() {
       width: Math.round(h.width * scale),
       height: Math.round(h.height * scale),
       borderRadius: h.borderRadius ? Math.round(h.borderRadius * scale) : 0,
+      points: h.points?.map((p) => ({ x: p.x * scale, y: p.y * scale })),
     }));
 
     // Scale overlays
@@ -216,7 +396,8 @@ export default function App() {
     setFrameCanvas(newCanvas);
     setHoles(scaledHoles);
     setOverlays(scaledOverlays);
-    recordHistory(scaledHoles);
+    // Coordinates changed scale: older snapshots would no longer fit the frame
+    resetHistory(scaledHoles, scaledOverlays);
   };
 
   // Delete hole
@@ -228,7 +409,6 @@ export default function App() {
     if (selectedHoleId === id) {
       setSelectedHoleId(nextHoles[0]?.id || null);
     }
-    recordHistory(nextHoles);
   };
 
   // Overlay handlers (Text, Logo, Stickers)
@@ -238,9 +418,9 @@ export default function App() {
     setSelectedHoleId(null);
   };
 
-  const handleUpdateOverlay = (updated: OverlayItem) => {
+  const handleUpdateOverlay = useCallback((updated: OverlayItem) => {
     setOverlays((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
-  };
+  }, []);
 
   const handleDeleteOverlay = (id: string) => {
     setOverlays((prev) => prev.filter((o) => o.id !== id));
@@ -268,16 +448,15 @@ export default function App() {
     const target = holes.find((h) => h.id === id);
     if (!target) return;
     const duplicated: HoleItem = {
-      ...target,
+      ...patchHole(target, {
+        x: Math.min(dimensions.widthPx - target.width, target.x + 30),
+        y: Math.min(dimensions.heightPx - target.height, target.y + 30),
+      }),
       id: `hole-${Date.now()}`,
       order: holes.length + 1,
-      x: Math.min(dimensions.widthPx - target.width, target.x + 30),
-      y: Math.min(dimensions.heightPx - target.height, target.y + 30),
     };
-    const nextHoles = [...holes, duplicated];
-    setHoles(nextHoles);
+    setHoles([...holes, duplicated]);
     setSelectedHoleId(duplicated.id);
-    recordHistory(nextHoles);
   };
 
   // Alignment functions
@@ -286,35 +465,22 @@ export default function App() {
   ) => {
     if (!selectedHoleId && type !== 'distribute-v') return;
 
-    let nextHoles = [...holes];
+    const alignSelected = (getPatch: (h: HoleItem) => Partial<HoleItem>) =>
+      holes.map((h) => (h.id === selectedHoleId ? patchHole(h, getPatch(h)) : h));
+
+    let nextHoles = holes;
     if (type === 'center-h') {
-      nextHoles = nextHoles.map((h) =>
-        h.id === selectedHoleId
-          ? { ...h, x: Math.round((dimensions.widthPx - h.width) / 2) }
-          : h
-      );
+      nextHoles = alignSelected((h) => ({ x: Math.round((dimensions.widthPx - h.width) / 2) }));
     } else if (type === 'center-v') {
-      nextHoles = nextHoles.map((h) =>
-        h.id === selectedHoleId
-          ? { ...h, y: Math.round((dimensions.heightPx - h.height) / 2) }
-          : h
-      );
+      nextHoles = alignSelected((h) => ({ y: Math.round((dimensions.heightPx - h.height) / 2) }));
     } else if (type === 'left') {
-      nextHoles = nextHoles.map((h) =>
-        h.id === selectedHoleId ? { ...h, x: 40 } : h
-      );
+      nextHoles = alignSelected(() => ({ x: 40 }));
     } else if (type === 'right') {
-      nextHoles = nextHoles.map((h) =>
-        h.id === selectedHoleId ? { ...h, x: dimensions.widthPx - h.width - 40 } : h
-      );
+      nextHoles = alignSelected((h) => ({ x: dimensions.widthPx - h.width - 40 }));
     } else if (type === 'top') {
-      nextHoles = nextHoles.map((h) =>
-        h.id === selectedHoleId ? { ...h, y: 50 } : h
-      );
+      nextHoles = alignSelected(() => ({ y: 50 }));
     } else if (type === 'bottom') {
-      nextHoles = nextHoles.map((h) =>
-        h.id === selectedHoleId ? { ...h, y: dimensions.heightPx - h.height - 50 } : h
-      );
+      nextHoles = alignSelected((h) => ({ y: dimensions.heightPx - h.height - 50 }));
     } else if (type === 'distribute-v') {
       if (holes.length < 2) return;
       // Sort by Y coordinate
@@ -327,62 +493,59 @@ export default function App() {
 
       let currentY = top;
       nextHoles = sorted.map((h) => {
-        const item = { ...h, y: currentY };
+        const item = patchHole(h, { y: currentY });
         currentY += h.height + gap;
         return item;
       });
     }
 
     setHoles(nextHoles);
-    recordHistory(nextHoles);
   };
 
-  // Undo / Redo handlers
-  const handleUndo = () => {
-    if (historyIdx > 0) {
-      const prev = history[historyIdx - 1];
-      setHoles(prev);
-      setHistoryIdx(historyIdx - 1);
+  // Keyboard shortcuts. The handler is refreshed every render so it always sees the
+  // latest holes/overlays/selection (no stale closures), while the listener is bound once.
+  const keyHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  keyHandlerRef.current = (e: KeyboardEvent) => {
+    const target = e.target as HTMLElement | null;
+    if (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target instanceof HTMLSelectElement ||
+      target?.isContentEditable
+    ) {
+      return;
+    }
+    const key = e.key.toLowerCase();
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selectedHoleId) {
+        e.preventDefault();
+        handleDeleteHole(selectedHoleId);
+      } else if (selectedOverlayId) {
+        e.preventDefault();
+        handleDeleteOverlay(selectedOverlayId);
+      }
+    } else if (e.key === 'Escape') {
+      setSelectedHoleId(null);
+      setSelectedOverlayId(null);
+      setMagicWandActive(false);
+    } else if ((e.ctrlKey || e.metaKey) && key === 'z') {
+      e.preventDefault();
+      if (e.shiftKey) {
+        handleRedo();
+      } else {
+        handleUndo();
+      }
+    } else if ((e.ctrlKey || e.metaKey) && key === 'y') {
+      e.preventDefault();
+      handleRedo();
     }
   };
 
-  const handleRedo = () => {
-    if (historyIdx < history.length - 1) {
-      const next = history[historyIdx + 1];
-      setHoles(next);
-      setHistoryIdx(historyIdx + 1);
-    }
-  };
-
-  // Keyboard shortcut listener
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-        return;
-      }
-      if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selectedHoleId) {
-          handleDeleteHole(selectedHoleId);
-        } else if (selectedOverlayId) {
-          handleDeleteOverlay(selectedOverlayId);
-        }
-      }
-      if (e.key === 'Escape') {
-        setSelectedHoleId(null);
-        setSelectedOverlayId(null);
-        setMagicWandActive(false);
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
-        if (e.shiftKey) {
-          handleRedo();
-        } else {
-          handleUndo();
-        }
-      }
-    };
+    const onKeyDown = (e: KeyboardEvent) => keyHandlerRef.current(e);
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [selectedHoleId, selectedOverlayId, historyIdx, history]);
+  }, []);
 
   const selectedHole = holes.find((h) => h.id === selectedHoleId) || null;
   const selectedOverlay = overlays.find((o) => o.id === selectedOverlayId) || null;
@@ -394,8 +557,8 @@ export default function App() {
         dimensions={dimensions}
         viewMode={viewMode}
         magicWandActive={magicWandActive}
-        canUndo={historyIdx > 0}
-        canRedo={historyIdx < history.length - 1}
+        canUndo={historyState.idx > 0}
+        canRedo={historyState.idx < historyState.length - 1}
         onAddHole={handleAddHole}
         onToggleMagicWand={() => setMagicWandActive((v) => !v)}
         onOpenAutoArrange={() => setIsAutoArrangeModalOpen(true)}
@@ -446,6 +609,7 @@ export default function App() {
           onSelectOverlay={handleSelectOverlay}
           onUpdateOverlay={handleUpdateOverlay}
           onAddDetectedHole={handleAddDetectedHole}
+          onInteractionChange={handleInteractionChange}
           setZoom={setZoom}
         />
 
@@ -473,7 +637,6 @@ export default function App() {
         onApplyLayout={(newHoles) => {
           setHoles(newHoles);
           setSelectedHoleId(newHoles[0]?.id || null);
-          recordHistory(newHoles);
         }}
       />
 

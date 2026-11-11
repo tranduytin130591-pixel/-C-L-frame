@@ -218,7 +218,7 @@ function traceContourPoints(
   let startY = -1;
   for (let y = minY; y <= maxY; y++) {
     for (let x = minX; x <= maxX; x++) {
-      if (mask[y * w + x]) {
+      if (mask[y * w + x] === 1) {
         startX = x;
         startY = y;
         break;
@@ -237,17 +237,19 @@ function traceContourPoints(
   const contour: { x: number; y: number }[] = [];
   let currX = startX;
   let currY = startY;
-  let dir = 7; // entering from NW
+  // Treat the start pixel as reached by moving North, so the first search begins at
+  // West: W, NW, N are outside for the top-left pixel and tracing proceeds clockwise.
+  let dir = 0;
 
   contour.push({ x: currX, y: currY });
 
-  const maxSteps = 12000;
+  const maxSteps = 200000;
   let steps = 0;
 
   while (steps < maxSteps) {
     steps++;
-    // backtrack 2 steps or start search from (dir + 5) % 8
-    let searchDir = (dir + 5) % 8;
+    // Moore neighbourhood: resume the clockwise search two steps back from the last move
+    const searchDir = (dir + 6) % 8;
     let foundNext = false;
 
     for (let i = 0; i < 8; i++) {
@@ -255,7 +257,7 @@ function traceContourPoints(
       const nx = currX + dx[checkDir];
       const ny = currY + dy[checkDir];
 
-      if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[ny * w + nx]) {
+      if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[ny * w + nx] === 1) {
         currX = nx;
         currY = ny;
         dir = checkDir;
@@ -277,19 +279,104 @@ function traceContourPoints(
   // Downsample & simplify contour polygon
   if (contour.length <= 4) return contour;
 
-  // Simplify: Douglas-Peucker or sampling every step
-  const sampleStep = Math.max(1, Math.floor(contour.length / 120));
-  const simplified: { x: number; y: number }[] = [];
-  for (let i = 0; i < contour.length; i += sampleStep) {
-    simplified.push(contour[i]);
+  // Douglas-Peucker simplification keeps corners sharp (max deviation ~1.5px)
+  const simplified = simplifyClosedPath(contour, 1.5);
+
+  // Contour points are boundary pixel indices. Map pixel centers so the outline spans
+  // the full pixel extent [minX, maxX + 1] x [minY, maxY + 1], leaving no 1px sliver of
+  // frame on the right/bottom edges of the cut.
+  const bw = maxX - minX + 1;
+  const bh = maxY - minY + 1;
+  const cx = minX + bw / 2;
+  const cy = minY + bh / 2;
+  const kx = bw > 1 ? bw / (bw - 1) : 1;
+  const ky = bh > 1 ? bh / (bh - 1) : 1;
+  return simplified.map((p) => ({
+    x: cx + (p.x + 0.5 - cx) * kx,
+    y: cy + (p.y + 0.5 - cy) * ky,
+  }));
+}
+
+function simplifyClosedPath(
+  pts: { x: number; y: number }[],
+  epsilon: number
+): { x: number; y: number }[] {
+  if (pts.length < 4) return pts;
+  // Split the loop at the point farthest from the start so both halves are open chains
+  let far = 0;
+  let farDist = -1;
+  for (let i = 1; i < pts.length; i++) {
+    const d = (pts[i].x - pts[0].x) ** 2 + (pts[i].y - pts[0].y) ** 2;
+    if (d > farDist) {
+      farDist = d;
+      far = i;
+    }
   }
-  // Ensure closed loop
-  if (simplified.length > 2) {
-    simplified.push({ ...simplified[0] });
+  const closed = [...pts, pts[0]];
+  const keep = new Uint8Array(closed.length);
+  keep[0] = 1;
+  keep[far] = 1;
+  keep[closed.length - 1] = 1;
+
+  const stack: [number, number][] = [
+    [0, far],
+    [far, closed.length - 1],
+  ];
+  while (stack.length > 0) {
+    const [a, b] = stack.pop()!;
+    if (b - a < 2) continue;
+    const ax = closed[a].x;
+    const ay = closed[a].y;
+    const bx = closed[b].x;
+    const by = closed[b].y;
+    const len = Math.hypot(bx - ax, by - ay) || 1;
+    let maxD = -1;
+    let idx = -1;
+    for (let i = a + 1; i < b; i++) {
+      const d = Math.abs((bx - ax) * (ay - closed[i].y) - (ax - closed[i].x) * (by - ay)) / len;
+      if (d > maxD) {
+        maxD = d;
+        idx = i;
+      }
+    }
+    if (maxD > epsilon) {
+      keep[idx] = 1;
+      stack.push([a, idx], [idx, b]);
+    }
   }
 
-  return simplified;
+  const out: { x: number; y: number }[] = [];
+  for (let i = 0; i < closed.length - 1; i++) {
+    if (keep[i]) out.push(closed[i]);
+  }
+  return out;
 }
+
+// Frame canvases are never mutated after creation (DPI change / upload create a new
+// canvas), so their pixel data can be read once and reused for every detection.
+const imageDataCache = new WeakMap<HTMLCanvasElement, ImageData>();
+function getCachedImageData(canvas: HTMLCanvasElement): ImageData | null {
+  const cached = imageDataCache.get(canvas);
+  if (cached && cached.width === canvas.width && cached.height === canvas.height) {
+    return cached;
+  }
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  imageDataCache.set(canvas, imgData);
+  return imgData;
+}
+
+// Last flood-filled region: hovering anywhere inside it reuses the result instantly.
+let lastDetect: {
+  canvas: HTMLCanvasElement;
+  tolerance: number;
+  mask: Uint8Array; // 1 = pixel belongs to the region
+  result: DetectedHoleResult | null;
+} | null = null;
+
+// Reusable BFS queue (pixel indices) to avoid reallocating per detection
+let queueBuffer = new Int32Array(0);
 
 /**
  * Auto-detect holes with smart boundary recognition.
@@ -302,15 +389,27 @@ export function detectHoleAtPoint(
   clickY: number,
   tolerance: number = 28
 ): DetectedHoleResult | null {
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return null;
-
   const w = canvas.width;
   const h = canvas.height;
-  const imgData = ctx.getImageData(0, 0, w, h);
+  const px = Math.floor(clickX);
+  const py = Math.floor(clickY);
+  if (px < 0 || py < 0 || px >= w || py >= h) return null;
+
+  if (
+    lastDetect &&
+    lastDetect.canvas === canvas &&
+    lastDetect.tolerance === tolerance &&
+    lastDetect.mask.length === w * h &&
+    lastDetect.mask[py * w + px] === 1
+  ) {
+    return lastDetect.result;
+  }
+
+  const imgData = getCachedImageData(canvas);
+  if (!imgData) return null;
   const data = imgData.data;
 
-  const startIdx = (Math.floor(clickY) * w + Math.floor(clickX)) * 4;
+  const startIdx = (py * w + px) * 4;
   const targetR = data[startIdx];
   const targetG = data[startIdx + 1];
   const targetB = data[startIdx + 2];
@@ -319,36 +418,51 @@ export function detectHoleAtPoint(
   // If clicking transparent pixel, cannot detect
   if (targetA < 10) return null;
 
+  const maxDistSq = (tolerance * 1.5) * (tolerance * 1.5);
   function colorMatch(idx: number): boolean {
-    const r = data[idx];
-    const g = data[idx + 1];
-    const b = data[idx + 2];
-    const a = data[idx + 3];
-    if (a < 10) return false;
+    if (data[idx + 3] < 10) return false;
     // Euclidean color distance in RGB
-    const dr = r - targetR;
-    const dg = g - targetG;
-    const db = b - targetB;
-    return Math.sqrt(dr * dr + dg * dg + db * db) <= tolerance * 1.5;
+    const dr = data[idx] - targetR;
+    const dg = data[idx + 1] - targetG;
+    const db = data[idx + 2] - targetB;
+    return dr * dr + dg * dg + db * db <= maxDistSq;
   }
 
-  // Flood fill / Bounding box exploration
-  const visited = new Uint8Array(w * h);
-  const queue: number[] = [Math.floor(clickX), Math.floor(clickY)];
-  visited[Math.floor(clickY) * w + Math.floor(clickX)] = 1;
+  // Flood fill. mask: 0 = unvisited, 1 = matched (in region), 2 = rejected
+  const total = w * h;
+  const mask = new Uint8Array(total);
+  if (queueBuffer.length < total) queueBuffer = new Int32Array(total);
+  const queue = queueBuffer;
+  let head = 0;
+  let tail = 0;
+  const startPixel = py * w + px;
+  queue[tail++] = startPixel;
+  mask[startPixel] = 1;
 
-  let minX = clickX;
-  let maxX = clickX;
-  let minY = clickY;
-  let maxY = clickY;
+  let minX = px;
+  let maxX = px;
+  let minY = py;
+  let maxY = py;
   let count = 0;
 
-  // Max search limit to keep it fast
-  const maxSearch = 800000;
+  // Safety cap for very large canvases
+  const maxSearch = 6_000_000;
 
-  while (queue.length > 0 && count < maxSearch) {
-    const qx = queue.shift()!;
-    const qy = queue.shift()!;
+  const visit = (nIdx: number) => {
+    if (mask[nIdx] === 0) {
+      if (colorMatch(nIdx * 4)) {
+        mask[nIdx] = 1;
+        queue[tail++] = nIdx;
+      } else {
+        mask[nIdx] = 2;
+      }
+    }
+  };
+
+  while (head < tail && count < maxSearch) {
+    const idx = queue[head++];
+    const qx = idx % w;
+    const qy = (idx - qx) / w;
     count++;
 
     if (qx < minX) minX = qx;
@@ -356,63 +470,54 @@ export function detectHoleAtPoint(
     if (qy < minY) minY = qy;
     if (qy > maxY) maxY = qy;
 
-    const neighbors = [
-      [qx + 1, qy],
-      [qx - 1, qy],
-      [qx, qy + 1],
-      [qx, qy - 1],
-    ];
-
-    for (const [nx, ny] of neighbors) {
-      if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-        const nIdx = ny * w + nx;
-        if (!visited[nIdx]) {
-          visited[nIdx] = 1;
-          const pixelIdx = nIdx * 4;
-          if (colorMatch(pixelIdx)) {
-            queue.push(nx, ny);
-          }
-        }
-      }
-    }
+    if (qx + 1 < w) visit(idx + 1);
+    if (qx > 0) visit(idx - 1);
+    if (qy + 1 < h) visit(idx + w);
+    if (qy > 0) visit(idx - w);
   }
 
   const boxW = maxX - minX + 1;
   const boxH = maxY - minY + 1;
+
+  const remember = (result: DetectedHoleResult | null) => {
+    lastDetect = { canvas, tolerance, mask, result };
+    return result;
+  };
+
+  // A region spanning (almost) the whole frame is the frame background/border, not a photo slot
+  if (boxW >= w * 0.97 && boxH >= h * 0.97) {
+    return remember(null);
+  }
 
   // Must be a reasonable size for a photo hole (e.g. > 35px width and height)
   if (boxW >= 35 && boxH >= 35 && count > 1000) {
     const boxArea = boxW * boxH;
     const fillRatio = count / boxArea;
 
-    // Check if there is significant indentation/intrusion by stickers or icons:
-    // If fill ratio is less than ~92%, there are intrusions (such as a sticker or heart icon overlapping the photo hole).
-    // Trace exact contour points so the cutout path hugs the stickers without chopping them off!
+    // Only a (practically) full bounding box is a plain rectangle. Anything else — a
+    // sticker biting into a corner, rounded/circular slots, odd shapes — gets the traced
+    // contour so the cut hugs the region and never chops decorations off. Even a small
+    // corner sticker covers only a few % of the box, so the threshold must be strict.
     let points: { x: number; y: number }[] | undefined;
     let type: 'rect' | 'rounded' | 'circle' | 'polygon' = 'rect';
 
-    if (fillRatio < 0.93 && fillRatio > 0.4) {
-      // Shape has intrusions or cut-ins by stickers: produce contour polygon
-      const contour = traceContourPoints(visited, w, h, minX, minY, maxX, maxY);
+    if (fillRatio < 0.995) {
+      const contour = traceContourPoints(mask, w, h, minX, minY, maxX, maxY);
       if (contour.length > 5) {
         points = contour;
         type = 'polygon';
       }
-    } else {
-      // Near rectangular: check corner radius
-      type = 'rounded';
     }
 
-    return {
+    return remember({
       x: Math.round(minX),
       y: Math.round(minY),
       width: Math.round(boxW),
       height: Math.round(boxH),
       points,
       type,
-      borderRadius: type === 'rounded' ? 8 : undefined,
-    };
+    });
   }
 
-  return null;
+  return remember(null);
 }

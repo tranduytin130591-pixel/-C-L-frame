@@ -19,6 +19,8 @@ interface CanvasAreaProps {
   onSelectOverlay?: (id: string | null) => void;
   onUpdateOverlay?: (updated: OverlayItem) => void;
   onAddDetectedHole: (box: DetectedHoleResult) => void;
+  /** Called with true when a drag/resize starts and false when it ends */
+  onInteractionChange?: (active: boolean) => void;
   setZoom: React.Dispatch<React.SetStateAction<number>>;
 }
 
@@ -50,6 +52,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
   onSelectOverlay,
   onUpdateOverlay,
   onAddDetectedHole,
+  onInteractionChange,
   setZoom,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -59,6 +62,32 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
   const [dragStartOverlay, setDragStartOverlay] = useState<{ mouseX: number; mouseY: number; initialOverlay: OverlayItem } | null>(null);
   const [sampleImages, setSampleImages] = useState<HTMLImageElement[]>([]);
   const [hoveredDetectBox, setHoveredDetectBox] = useState<DetectedHoleResult | null>(null);
+  const hoverFrameRef = useRef<number | null>(null);
+  const pendingHoverRef = useRef<{ x: number; y: number } | null>(null);
+
+  // Clear the magic wand preview when the wand is turned off
+  useEffect(() => {
+    if (!magicWandActive) setHoveredDetectBox(null);
+  }, [magicWandActive]);
+
+  useEffect(() => {
+    return () => {
+      if (hoverFrameRef.current !== null) cancelAnimationFrame(hoverFrameRef.current);
+    };
+  }, []);
+
+  // End drag even if the mouse button is released outside the canvas / window
+  useEffect(() => {
+    if (!dragMode) return;
+    const onUp = () => {
+      setDragMode(null);
+      setDragStart(null);
+      setDragStartOverlay(null);
+      onInteractionChange?.(false);
+    };
+    window.addEventListener('mouseup', onUp);
+    return () => window.removeEventListener('mouseup', onUp);
+  }, [dragMode, onInteractionChange]);
 
   // Preload sample photos for previewing photobooth poses
   useEffect(() => {
@@ -299,10 +328,18 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
   const handleMouseDown = (e: React.MouseEvent) => {
     const coords = getCanvasCoords(e.clientX, e.clientY);
 
-    // If magic wand active, try detect hole
+    // If magic wand active, try detect hole (skip slots that are already punched)
     if (magicWandActive && frameCanvas) {
-      const box = detectHoleAtPoint(frameCanvas, coords.x, coords.y);
+      const insideExisting = holes.some(
+        (h) =>
+          coords.x >= h.x &&
+          coords.x <= h.x + h.width &&
+          coords.y >= h.y &&
+          coords.y <= h.y + h.height
+      );
+      const box = insideExisting ? null : detectHoleAtPoint(frameCanvas, coords.x, coords.y);
       if (box) {
+        setHoveredDetectBox(null);
         onAddDetectedHole(box);
         return;
       }
@@ -321,6 +358,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
         onSelectOverlay?.(item.id);
         onSelectHole(null);
         setDragMode('move-overlay');
+        onInteractionChange?.(true);
         setDragStartOverlay({
           mouseX: coords.x,
           mouseY: coords.y,
@@ -339,21 +377,25 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
       // Handle hit test
       if (Math.hypot(coords.x - x, coords.y - y) <= handleSize) {
         setDragMode('resize-tl');
+        onInteractionChange?.(true);
         setDragStart({ mouseX: coords.x, mouseY: coords.y, initialHole: { ...selectedHole } });
         return;
       }
       if (Math.hypot(coords.x - (x + w), coords.y - y) <= handleSize) {
         setDragMode('resize-tr');
+        onInteractionChange?.(true);
         setDragStart({ mouseX: coords.x, mouseY: coords.y, initialHole: { ...selectedHole } });
         return;
       }
       if (Math.hypot(coords.x - x, coords.y - (y + h)) <= handleSize) {
         setDragMode('resize-bl');
+        onInteractionChange?.(true);
         setDragStart({ mouseX: coords.x, mouseY: coords.y, initialHole: { ...selectedHole } });
         return;
       }
       if (Math.hypot(coords.x - (x + w), coords.y - (y + h)) <= handleSize) {
         setDragMode('resize-br');
+        onInteractionChange?.(true);
         setDragStart({ mouseX: coords.x, mouseY: coords.y, initialHole: { ...selectedHole } });
         return;
       }
@@ -371,6 +413,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
         onSelectHole(h.id);
         onSelectOverlay?.(null);
         setDragMode('move');
+        onInteractionChange?.(true);
         setDragStart({ mouseX: coords.x, mouseY: coords.y, initialHole: { ...h } });
         return;
       }
@@ -384,10 +427,18 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
   const handleMouseMove = (e: React.MouseEvent) => {
     const coords = getCanvasCoords(e.clientX, e.clientY);
 
-    // Magic wand hover preview
+    // Magic wand hover preview (throttled to one detection per animation frame)
     if (magicWandActive && frameCanvas && !dragMode) {
-      const box = detectHoleAtPoint(frameCanvas, coords.x, coords.y);
-      setHoveredDetectBox(box);
+      pendingHoverRef.current = coords;
+      if (hoverFrameRef.current === null) {
+        hoverFrameRef.current = requestAnimationFrame(() => {
+          hoverFrameRef.current = null;
+          const p = pendingHoverRef.current;
+          if (!p) return;
+          const box = detectHoleAtPoint(frameCanvas, p.x, p.y);
+          setHoveredDetectBox((prev) => (prev === box ? prev : box));
+        });
+      }
     }
 
     // Handle dragging overlay item
@@ -436,11 +487,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
     }
   };
 
-  const handleMouseUp = () => {
-    setDragMode(null);
-    setDragStart(null);
-    setDragStartOverlay(null);
-  };
 
   const selectedHole = holes.find((h) => h.id === selectedHoleId);
   const selectedOverlay = overlays.find((o) => o.id === selectedOverlayId);
@@ -450,7 +496,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = ({
     <div
       ref={containerRef}
       className="flex-1 bg-slate-100/90 overflow-auto relative flex items-center justify-center p-8 select-none"
-      onMouseUp={handleMouseUp}
     >
       {/* Zoom / Viewport controls Floating bar */}
       <div className="absolute bottom-5 right-5 z-20 flex items-center gap-1.5 bg-white/95 backdrop-blur-md px-3 py-2 rounded-xl shadow-lg border border-slate-200/80 text-xs text-slate-700">

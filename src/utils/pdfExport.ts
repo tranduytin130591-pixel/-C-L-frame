@@ -1,6 +1,60 @@
-import { PDFDocument, rgb } from 'pdf-lib';
+import { PDFDocument, PDFPage, rgb } from 'pdf-lib';
 import { ExportSettings, FrameDimensions, HoleItem, OverlayItem } from '../types';
 import { createPunchedFrameCanvas } from './canvasPuncher';
+
+interface PlacedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Fit an image of srcW x srcH into a box, keeping aspect ratio, centered */
+function fitRect(
+  srcW: number,
+  srcH: number,
+  boxX: number,
+  boxY: number,
+  boxW: number,
+  boxH: number
+): PlacedRect {
+  const scale = Math.min(boxW / srcW, boxH / srcH);
+  const width = srcW * scale;
+  const height = srcH * scale;
+  return {
+    x: boxX + (boxW - width) / 2,
+    y: boxY + (boxH - height) / 2,
+    width,
+    height,
+  };
+}
+
+/** Draw L-shaped crop marks inside each corner of the given rectangle */
+function drawCornerMarks(page: PDFPage, r: PlacedRect) {
+  const markLength = 12;
+  const inset = 15;
+  const thickness = 0.5;
+  const color = rgb(0.5, 0.5, 0.5);
+  const left = r.x;
+  const right = r.x + r.width;
+  const bottom = r.y;
+  const top = r.y + r.height;
+  const line = (x1: number, y1: number, x2: number, y2: number) =>
+    page.drawLine({ start: { x: x1, y: y1 }, end: { x: x2, y: y2 }, thickness, color });
+
+  // Top-left
+  line(left, top - inset, left + markLength, top - inset);
+  line(left + inset, top, left + inset, top - markLength);
+  // Top-right
+  line(right - markLength, top - inset, right, top - inset);
+  line(right - inset, top, right - inset, top - markLength);
+  // Bottom-left
+  line(left, bottom + inset, left + markLength, bottom + inset);
+  line(left + inset, bottom, left + inset, bottom + markLength);
+  // Bottom-right
+  line(right - markLength, bottom + inset, right, bottom + inset);
+  line(right - inset, bottom, right - inset, bottom + markLength);
+}
 
 /**
  * Generates a high-quality PDF with transparent holes punched out,
@@ -30,107 +84,51 @@ export async function exportPhotoboothPDF(
   const pngDataUrl = punchedCanvas.toDataURL('image/png');
   const pngImage = await pdfDoc.embedPng(pngDataUrl);
 
-  // Determine physical page dimensions in points (1 inch = 72 points in PDF standard)
+  // Physical size of the frame artwork in points (1 inch = 72 points in PDF standard)
+  const frameWInch = dimensions.physicalWidthInch || dimensions.widthPx / baseDpi;
+  const frameHInch = dimensions.physicalHeightInch || dimensions.heightPx / baseDpi;
+  const frameIsLandscape = dimensions.widthPx > dimensions.heightPx;
+
+  // Determine page size, oriented to match the frame
   let pageWidthPt: number;
   let pageHeightPt: number;
+  const orient = (shortPt: number, longPt: number) => {
+    pageWidthPt = frameIsLandscape ? longPt : shortPt;
+    pageHeightPt = frameIsLandscape ? shortPt : longPt;
+  };
 
   if (settings.paperSize === '4x6') {
-    if (dimensions.physicalWidthInch > dimensions.physicalHeightInch) {
-      pageWidthPt = 6 * 72; // 432 pt
-      pageHeightPt = 4 * 72; // 288 pt
-    } else {
-      pageWidthPt = 4 * 72; // 288 pt
-      pageHeightPt = 6 * 72; // 432 pt
-    }
+    orient(4 * 72, 6 * 72); // 288 x 432 pt
   } else if (settings.paperSize === '2x6') {
-    pageWidthPt = 2 * 72; // 144 pt
-    pageHeightPt = 6 * 72; // 432 pt
+    orient(2 * 72, 6 * 72); // 144 x 432 pt
   } else if (settings.paperSize === 'A4') {
-    pageWidthPt = 595.28;
-    pageHeightPt = 841.89;
+    orient(595.28, 841.89);
   } else if (settings.paperSize === 'A6') {
-    pageWidthPt = 297.64;
-    pageHeightPt = 419.53;
+    orient(297.64, 419.53);
   } else {
     // fit_frame: exact physical size calculated from inches
-    const wInch = dimensions.physicalWidthInch || dimensions.widthPx / baseDpi;
-    const hInch = dimensions.physicalHeightInch || dimensions.heightPx / baseDpi;
-    pageWidthPt = wInch * 72;
-    pageHeightPt = hInch * 72;
+    pageWidthPt = frameWInch * 72;
+    pageHeightPt = frameHInch * 72;
   }
 
   // Create page
-  const page = pdfDoc.addPage([pageWidthPt, pageHeightPt]);
+  const page = pdfDoc.addPage([pageWidthPt!, pageHeightPt!]);
 
-  // Draw the transparent frame image centered or fitted
-  page.drawImage(pngImage, {
-    x: 0,
-    y: 0,
-    width: pageWidthPt,
-    height: pageHeightPt,
-  });
+  // Place the frame without distortion: scale to fit the page (keeping aspect ratio)
+  // and center it. With fit_frame this fills the page exactly.
+  const rect = fitRect(
+    punchedCanvas.width,
+    punchedCanvas.height,
+    0,
+    0,
+    pageWidthPt!,
+    pageHeightPt!
+  );
+  page.drawImage(pngImage, rect);
 
-  // Optional: Add registration/crop marks for photobooth cutting
+  // Optional: Add registration/crop marks at the corners of the placed frame
   if (settings.includeCutMarks) {
-    const markLength = 12;
-    const strokeWidth = 0.5;
-    const markColor = rgb(0.5, 0.5, 0.5);
-
-    // Top-left
-    page.drawLine({
-      start: { x: 0, y: pageHeightPt - 15 },
-      end: { x: markLength, y: pageHeightPt - 15 },
-      thickness: strokeWidth,
-      color: markColor,
-    });
-    page.drawLine({
-      start: { x: 15, y: pageHeightPt },
-      end: { x: 15, y: pageHeightPt - markLength },
-      thickness: strokeWidth,
-      color: markColor,
-    });
-
-    // Top-right
-    page.drawLine({
-      start: { x: pageWidthPt - markLength, y: pageHeightPt - 15 },
-      end: { x: pageWidthPt, y: pageHeightPt - 15 },
-      thickness: strokeWidth,
-      color: markColor,
-    });
-    page.drawLine({
-      start: { x: pageWidthPt - 15, y: pageHeightPt },
-      end: { x: pageWidthPt - 15, y: pageHeightPt - markLength },
-      thickness: strokeWidth,
-      color: markColor,
-    });
-
-    // Bottom-left
-    page.drawLine({
-      start: { x: 0, y: 15 },
-      end: { x: markLength, y: 15 },
-      thickness: strokeWidth,
-      color: markColor,
-    });
-    page.drawLine({
-      start: { x: 15, y: 0 },
-      end: { x: 15, y: markLength },
-      thickness: strokeWidth,
-      color: markColor,
-    });
-
-    // Bottom-right
-    page.drawLine({
-      start: { x: pageWidthPt - markLength, y: 15 },
-      end: { x: pageWidthPt, y: 15 },
-      thickness: strokeWidth,
-      color: markColor,
-    });
-    page.drawLine({
-      start: { x: pageWidthPt - 15, y: 0 },
-      end: { x: pageWidthPt - 15, y: markLength },
-      thickness: strokeWidth,
-      color: markColor,
-    });
+    drawCornerMarks(page, rect);
   }
 
   // Set document metadata for professional photobooth workflow
@@ -174,21 +172,14 @@ export async function exportTwinStrips4x6PDF(
 
   const stripWidthPt = pageWidthPt / 2; // 144 pt (2 inches each)
 
-  // Strip 1 (Left side)
-  page.drawImage(pngImage, {
-    x: 0,
-    y: 0,
-    width: stripWidthPt,
-    height: pageHeightPt,
-  });
-
-  // Strip 2 (Right side duplicate)
-  page.drawImage(pngImage, {
-    x: stripWidthPt,
-    y: 0,
-    width: stripWidthPt,
-    height: pageHeightPt,
-  });
+  // Strip 1 (left) and Strip 2 (right duplicate), each fitted into its 2"x6" half
+  // without distortion
+  for (const offsetX of [0, stripWidthPt]) {
+    page.drawImage(
+      pngImage,
+      fitRect(punchedCanvas.width, punchedCanvas.height, offsetX, 0, stripWidthPt, pageHeightPt)
+    );
+  }
 
   // Cutting centerline guide mark
   if (settings.includeCutMarks) {
